@@ -15,7 +15,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build Release APK
@@ -33,7 +33,7 @@ jobs:
         env:
           BUILD_TOOLS_VERSION: "36.0.0"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release
           path: ${{steps.sign_app.outputs.signedReleaseFile}}
