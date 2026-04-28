@@ -14,6 +14,7 @@ import androidx.core.app.NotificationCompat
 import androidx.fragment.app.Fragment
 import com.looker.droidify.BuildConfig
 import com.looker.droidify.R
+import com.looker.droidify.content.ProductPreferences
 import com.looker.droidify.database.Database
 import com.looker.droidify.datastore.Settings
 import com.looker.droidify.datastore.SettingsRepository
@@ -588,12 +589,22 @@ class SyncService : ConnectionService<SyncService.Binder>() {
             }
             .filter { it.first != null && it.second != null }
             .forEach { (installItem, repo) ->
-                val productRepo = Database.ProductAdapter.get(installItem!!.packageName, null)
+                val installed = installItem!!
+
+                val preference = ProductPreferences[installed.packageName]
+
+                if (
+                    preference.ignoreUpdates
+                ) {
+                    return@forEach
+                }
+
+                val productRepo = Database.ProductAdapter.get(installed.packageName, null)
                     .filter { it.repositoryId == repo!!.id }
                     .map { it to repo!! }
                 downloadConnection.startUpdate(
-                    installItem.packageName,
-                    installItem,
+                    installed.packageName,
+                    installed,
                     productRepo,
                 )
             }
