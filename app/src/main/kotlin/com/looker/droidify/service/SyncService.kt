@@ -29,6 +29,7 @@ import com.looker.droidify.utility.common.SdkCheck
 import com.looker.droidify.utility.common.createNotificationChannel
 import com.looker.droidify.utility.common.extension.getColorFromAttr
 import com.looker.droidify.utility.common.extension.notificationManager
+import com.looker.droidify.utility.common.extension.startForegroundSafe
 import com.looker.droidify.utility.common.extension.startServiceCompat
 import com.looker.droidify.utility.common.extension.stopForegroundCompat
 import com.looker.droidify.utility.common.result.Result
@@ -38,9 +39,6 @@ import com.looker.droidify.utility.notifications.updatesAvailableNotification
 import com.looker.droidify.work.DownloadStatsWorker
 import com.looker.droidify.work.RBLogWorker
 import dagger.hilt.android.AndroidEntryPoint
-import java.lang.ref.WeakReference
-import javax.inject.Inject
-import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
@@ -57,6 +55,9 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
+import javax.inject.Inject
+import kotlin.math.roundToInt
 import android.R as AndroidR
 import com.looker.droidify.R.string as stringRes
 import com.looker.droidify.R.style as styleRes
@@ -117,6 +118,7 @@ class SyncService : ConnectionService<SyncService.Binder>() {
     private enum class Started { NO, AUTO, MANUAL }
 
     private var started = Started.NO
+    private var foregroundFailed = false
     private val tasks = mutableListOf<Task>()
     private var currentTask: CurrentTask? = null
 
@@ -140,7 +142,7 @@ class SyncService : ConnectionService<SyncService.Binder>() {
             val manual = request != SyncRequest.AUTO
             tasks += ids.asSequence().filter {
                 it !in currentIds &&
-                        it != currentTask?.task?.repositoryId
+                    it != currentTask?.task?.repositoryId
             }.map { Task(it, manual) }
             handleNextTask(cancelledTask?.hasUpdates == true, settings)
             if (request != SyncRequest.AUTO && started == Started.AUTO) {
@@ -188,7 +190,7 @@ class SyncService : ConnectionService<SyncService.Binder>() {
             val settings = runBlocking { settingsRepository.getInitial() }
             if (enabled) {
                 val isRepoInTasks = repository.id != currentTask?.task?.repositoryId &&
-                        !tasks.any { it.repositoryId == repository.id }
+                    !tasks.any { it.repositoryId == repository.id }
                 if (isRepoInTasks) {
                     tasks += Task(repository.id, true)
                     handleNextTask(false, settings)
@@ -272,14 +274,18 @@ class SyncService : ConnectionService<SyncService.Binder>() {
             handleNextTask(cancelledTask?.hasUpdates == true, settings)
             stopSelf()
         } else {
-            startForeground(
-                Constants.NOTIFICATION_ID_SYNCING,
-                stateNotificationBuilder
+            val promoted = startForegroundSafe(
+                id = Constants.NOTIFICATION_ID_SYNCING,
+                notification = stateNotificationBuilder
                     .setContentTitle(getString(stringRes.syncing_FORMAT, ""))
                     .setContentText(getString(stringRes.connecting))
                     .setProgress(0, 0, true)
                     .build(),
             )
+            if (!promoted) {
+                handleForegroundDenied()
+                return START_NOT_STICKY
+            }
         }
         return super.onStartCommand(intent, flags, startId)
     }
@@ -397,12 +403,13 @@ class SyncService : ConnectionService<SyncService.Binder>() {
     }
 
     private fun publishForegroundState(force: Boolean, state: State) {
+        if (foregroundFailed) return
         if (force || currentTask?.lastState != state) {
             currentTask = currentTask?.copy(lastState = state)
             if (started == Started.MANUAL) {
-                startForeground(
-                    Constants.NOTIFICATION_ID_SYNCING,
-                    stateNotificationBuilder.apply {
+                val promoted = startForegroundSafe(
+                    id = Constants.NOTIFICATION_ID_SYNCING,
+                    notification = stateNotificationBuilder.apply {
                         setContentTitle(getString(stringRes.syncing_FORMAT, state.name))
                         when (state) {
                             is State.Connecting -> {
@@ -460,8 +467,18 @@ class SyncService : ConnectionService<SyncService.Binder>() {
                         }
                     }.build(),
                 )
+                if (!promoted) handleForegroundDenied()
             }
         }
+    }
+
+    private fun handleForegroundDenied() {
+        if (foregroundFailed) return
+        foregroundFailed = true
+        cancelTasks { true }
+        cancelCurrentTask { true }
+        started = Started.NO
+        stopForegroundCompat()
     }
 
     private fun handleSetStarted() {
@@ -499,7 +516,7 @@ class SyncService : ConnectionService<SyncService.Binder>() {
                 task = task,
                 repository = repository,
                 isIndexModified = isIndexModified,
-                settings = settings
+                settings = settings,
             )
             currentTask = CurrentTask(task, downloadJob, isIndexModified, initialState)
         }
@@ -553,6 +570,10 @@ class SyncService : ConnectionService<SyncService.Binder>() {
             val blocked = updateNotificationBlockerFragment?.get()?.isAdded == true
             val updates = Database.ProductAdapter.getUpdates(settings.ignoreSignature)
 
+            val needStop = started == Started.MANUAL
+            started = Started.NO
+            if (needStop) stopForegroundCompat()
+
             if (!blocked && updates.isNotEmpty()) {
                 if (settings.notifyUpdate) {
                     notificationManager?.notify(
@@ -568,9 +589,6 @@ class SyncService : ConnectionService<SyncService.Binder>() {
             }
 
             syncState.emit(State.Finish)
-            val needStop = started == Started.MANUAL
-            started = Started.NO
-            if (needStop) stopForegroundCompat()
         } finally {
             withContext(NonCancellable) {
                 lock.withLock { currentTask = null }
@@ -585,7 +603,7 @@ class SyncService : ConnectionService<SyncService.Binder>() {
             .sortedBy { if (it.packageName == packageName) 1 else -1 }
             .map {
                 Database.InstalledAdapter.get(it.packageName, null) to
-                        Database.RepositoryAdapter.get(it.repositoryId)
+                    Database.RepositoryAdapter.get(it.repositoryId)
             }
             .filter { it.first != null && it.second != null }
             .forEach { (installItem, repo) ->
